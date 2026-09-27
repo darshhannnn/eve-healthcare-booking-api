@@ -12,7 +12,7 @@
 
 - **Clean API design** — 22 documented endpoints with a uniform error contract, a shared pagination envelope, and Swagger/OpenAPI at [`/docs`](#quick-start) with one-click auth.
 - **Correct data modelling** — priced centre↔test offerings instead of duplicated rows, amount *snapshotted* at booking time, money as `NUMERIC(10,2)` and JSON strings (never floats), timezone-aware UTC timestamps everywhere.
-- **Idempotency done properly** — every webhook delivery is recorded in an event ledger keyed by the provider's `event_id`; duplicates, conflicting and late events are handled explicitly, with a unique-constraint backstop for concurrent deliveries.
+- **Idempotency done properly** — every webhook delivery is recorded in an event ledger keyed by the provider's `event_id`; duplicates, conflicting and late events are handled explicitly, with a unique-constraint backstop for concurrent deliveries. The same `Idempotency-Key` replay protection covers `POST /bookings` and `POST /payments`, and booking creation serializes per user with a row lock (see [assumptions](#assumptions) for the honest caveats).
 - **Edge cases first** — 40+ failure paths mapped to specific status codes ([full table](#edge-cases-handled)).
 - **Tested** — 68 tests running in **GitHub Actions CI** on Python 3.11–3.13, with an isolated in-memory database per test.
 - **Ops-ready extras** — Docker & docker-compose with healthchecks, JSON structured logging, rate limiting, a Redis-ready TTL cache, and admin tooling for webhook retries.
@@ -98,7 +98,7 @@ Interactive docs: **`/docs`** (Swagger UI) and **`/redoc`**. All responses are J
 | DELETE | `/centres/{id}/offerings/{test_id}` | Admin | Remove offering → `204` |
 | GET | `/tests` | — | Global test catalogue. `?page`, `?page_size`, `?search=` |
 | POST | `/tests` | Admin | Add a test to the catalogue |
-| POST | `/bookings` | Bearer | Book a test `{centre_id, test_id, appointment_at}` → `201` |
+| POST | `/bookings` | Bearer | Book a test `{centre_id, test_id, appointment_at}` → `201`; optional `Idempotency-Key` header for safe retries |
 | GET | `/bookings` | Bearer | Own bookings (admins: all). `?status=PENDING…`, `?page` |
 | GET | `/bookings/{id}` | Bearer | Booking detail (owner or admin) |
 | POST | `/bookings/{id}/cancel` | Bearer | Cancel (owner or admin) |
@@ -244,7 +244,7 @@ Design choices worth calling out:
 | Booking a test the centre doesn't offer | `422` "not offered at centre" |
 | Unknown centre/test/booking/payment | `404` |
 | Appointment in the past | `422` |
-| Duplicate slot (same user+centre+test+time) | `409` (re-booking after cancellation is allowed) |
+| Duplicate slot (same user+centre+test+time) | `409` — app-level check, plus the user's row is locked `FOR UPDATE` so their concurrent bookings serialize on PostgreSQL; re-booking after cancellation is allowed |
 | Accessing/cancelling/paying for **someone else's** booking | `403` |
 | Paying a non-PENDING (confirmed/failed/cancelled) booking | `409` |
 | Cancel a failed/cancelled booking, or one whose appointment passed | `409` |
@@ -254,6 +254,8 @@ Design choices worth calling out:
 | Conflicting/out-of-order webhook statuses | ignored & logged, state never corrupts |
 | Webhook referencing an unknown payment | `404`, stored `UNMATCHED`, admin retry endpoint |
 | Login/signup flooding | `429` with `Retry-After` (fixed-window, per IP) |
+| Hammering `/bookings`, `/payments` or cancel | `429` with `Retry-After` (separate budget from auth) |
+| Client retry of `POST /bookings` after a timeout | Same `Idempotency-Key` → original booking (`200`) instead of `409` |
 | Naive datetimes in requests | interpreted as UTC (documented) |
 
 ## Bonus engineering included
@@ -263,7 +265,7 @@ Design choices worth calling out:
 - **Unit/integration tests** — 68 tests (auth, RBAC, catalog, bookings, payments, webhook idempotency, rate limiting, pagination) against an isolated in-memory DB per test.
 - **Structured logging** — JSON log lines with request id, method, path, status and duration; `X-Request-ID` accepted and propagated.
 - **Pagination** — uniform `{items, total, page, page_size, pages}` envelope on every list endpoint.
-- **Rate limiting** — fixed-window limiter on auth endpoints (in-memory; swappable for Redis).
+- **Rate limiting** — fixed-window limiter on auth endpoints *and* on mutating endpoints (create/cancel booking, create payment), in-memory; swappable for Redis.
 - **Caching** — TTL read cache for centre/test listings with write-through invalidation on admin mutations; **Redis backend supported** via `CACHE_BACKEND=redis` and `REDIS_URL`, with graceful fallback when Redis is down.
 - **Webhook retry handling** — every delivery is persisted with an outcome (`PROCESSED`/`IGNORED`/`UNMATCHED`); unmatched events are retryable from the admin API.
 - **CI** — GitHub Actions runs the full suite with coverage on Python 3.11, 3.12 and 3.13 for every push and pull request.
@@ -283,6 +285,8 @@ All settings come from environment variables (or `.env`, see [.env.example](.env
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | `admin@example.com` / `Admin@12345` | Bootstrap admin |
 | `SEED_DEMO_DATA` | `false` | Seed centres/tests/demo patient |
 | `RATE_LIMIT_AUTH_PER_MINUTE` | `30` (`0` disables) | Auth endpoints, per IP |
+| `RATE_LIMIT_MUTATIONS_PER_MINUTE` | `60` (`0` disables) | Create/cancel booking, create payment, per IP |
+| `DOCS_ENABLED` | `true` | Set `false` in production to disable `/docs`, `/redoc` and `/openapi.json` |
 | `CACHE_BACKEND` / `REDIS_URL` | `memory` / — | `redis` enables the Redis cache backend |
 | `DEFAULT_PAGE_SIZE` / `MAX_PAGE_SIZE` | `20` / `100` | Pagination bounds |
 
@@ -296,6 +300,8 @@ pytest tests/test_webhooks.py -v   # just the idempotency suite
 
 The same suite runs in **GitHub Actions** (badge at the top) on Python 3.11–3.13 for every push. Each test gets a fresh in-memory SQLite database (shared connection pool so the app and assertions see the same data); the suite runs without PostgreSQL or Docker. The same business logic runs against PostgreSQL in docker-compose.
 
+**Honest caveat:** the row-locking that protects concurrent payment and booking creation is a no-op on SQLite, so this suite structurally cannot exercise it — `test_concurrent_duplicate_slot_creates_single_booking` is permanently skipped with that exact reason, and the guarantee holds on the PostgreSQL path. Running the suite against a PostgreSQL database executes it.
+
 ## Assumptions
 
 1. **Mock gateway is synchronous.** `POST /payments` returns the final `SUCCESS`/`FAILED` and updates the booking, per the assignment's flow. The webhook exists for provider-driven deliveries (retries/late events) and is where duplicate-delivery safety is enforced.
@@ -304,7 +310,7 @@ The same suite runs in **GitHub Actions** (badge at the top) on Python 3.11–3.
 4. **Cancellation** is allowed for PENDING/CONFIRMED bookings with a **future** appointment; refunds are out of scope (noted as an improvement).
 5. **Centre/test management is admin-only**; reading the catalogue is public. Admin is bootstrapped from env at startup.
 6. **Booking authorization** returns `403` (not 404) for another user's booking — explicit and testable; listing is always owner-scoped.
-7. **Duplicate slot rule:** same user + centre + test + exact appointment time. Re-booking after cancellation is allowed. (A partial unique index would enforce this at the DB level on PostgreSQL — see improvements.)
+7. **Duplicate slot rule:** same user + centre + test + exact appointment time. A read-then-insert duplicate check is racy on its own, so booking creation first takes a `FOR UPDATE` lock on the *user's* row, serializing each user's booking creations on PostgreSQL — the same class of fix the payment path uses (`FOR UPDATE` on the booking row). On SQLite (dev/tests, single-threaded) both locks are no-ops, so the concurrency path is structurally untested by the suite — a partial unique index on PostgreSQL would add DB-level defence in depth (see improvements). Re-booking after cancellation is allowed.
 8. **Naive timestamps are UTC.** Clients are encouraged to send explicit offsets.
 9. **Amounts are snapshot-priced** at booking time; later price changes don't affect existing bookings.
 10. **SQLite is a dev/test convenience**; PostgreSQL is the intended production database (psycopg 3 driver).
@@ -315,10 +321,11 @@ The same suite runs in **GitHub Actions** (badge at the top) on Python 3.11–3.
 2. **Async payment flow with Celery + Redis:** `POST /payments` would enqueue a `process_payment` task (broker = Redis), return `PENDING`, and the worker would settle the booking and emit the webhook — making the webhook the primary settlement path, with exponential-backoff retries for transient failures.
 3. **Provider abstraction:** an interface the mock implements, so a real gateway (Stripe/Razorpay) can be added without touching booking logic; signatures verified via the same webhook path.
 4. **Refresh tokens & revocation** (jti denylist), email verification, password reset.
-5. **PostgreSQL partial unique index** (`WHERE status <> 'CANCELLED'`) to enforce the duplicate-slot rule at the DB level under concurrency.
+5. **PostgreSQL partial unique index** (`WHERE status <> 'CANCELLED'`) on the booking slot as DB-level defence in depth on top of the user-row lock.
 6. **Redis-backed rate limiting and distributed locks** (`SELECT … FOR UPDATE` is already used for payment transitions) for multi-worker deployments.
 7. **Observability:** Prometheus metrics, trace ids propagated to logs, Sentry.
 8. **Tooling & hardening:** ruff/mypy in CI, pre-commit, gunicorn+uvicorn workers, per-endpoint OpenAPI examples, a Postman collection.
+9. **API versioning** (`/v1/...`) before the contract has real external clients; the routers are already grouped to make that a one-line prefix change.
 
 ## Project structure
 

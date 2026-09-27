@@ -19,14 +19,20 @@ _counters: dict[str, tuple[float, int]] = {}
 _lock = threading.Lock()
 
 
-def rate_limit(scope: str):
-    """Dependency factory enforcing ``RATE_LIMIT_AUTH_PER_MINUTE`` per IP."""
+def rate_limit(scope: str, settings_attr: str = "RATE_LIMIT_AUTH_PER_MINUTE"):
+    """Dependency factory enforcing a fixed-window limit per IP.
+
+    The limit value is read from ``settings.<settings_attr>`` on every call
+    so it can be tuned at runtime (and monkeypatched in tests).
+    """
 
     def dependency(request: Request) -> None:
         settings = get_settings()
-        if not settings.RATE_LIMIT_ENABLED or settings.RATE_LIMIT_AUTH_PER_MINUTE <= 0:
+        if not settings.RATE_LIMIT_ENABLED:
             return
-        limit = settings.RATE_LIMIT_AUTH_PER_MINUTE
+        limit = getattr(settings, settings_attr)
+        if limit <= 0:
+            return
         client_ip = request.client.host if request.client else "unknown"
         key = f"{scope}:{client_ip}"
         now = time.monotonic()

@@ -36,6 +36,11 @@ class Booking(Base):
     status: Mapped[str] = mapped_column(
         String(20), default=BookingStatus.PENDING.value, index=True, nullable=False
     )
+    # Optional client-supplied key so retried POST /bookings calls are safe
+    # (mirrors payments.idempotency_key).
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(120), unique=True, index=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

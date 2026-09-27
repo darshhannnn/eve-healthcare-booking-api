@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     # Fixed-window rate limit applied to auth endpoints (per client IP).
     RATE_LIMIT_ENABLED: bool = True
     RATE_LIMIT_AUTH_PER_MINUTE: int = 30
+    # Applied to mutating endpoints (create/cancel booking, create payment).
+    RATE_LIMIT_MUTATIONS_PER_MINUTE: int = 60
+
+    # Gate /docs, /redoc and /openapi.json — set false in production.
+    DOCS_ENABLED: bool = True
 
     # Read-through cache for centres/tests listing endpoints.
     CACHE_BACKEND: str = "memory"  # "memory" | "redis"

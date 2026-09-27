@@ -45,3 +45,34 @@ def test_rate_limit_disabled_by_test_env(client):
     for _ in range(5):
         resp = client.post("/auth/login", json={"email": user.email, "password": user.password})
         assert resp.status_code == 200
+
+
+def test_mutating_endpoints_rate_limited(client, monkeypatch):
+    """POST /bookings, /payments and cancel share a fixed window per IP."""
+    from app.core.config import get_settings
+    from app.utils.rate_limit import reset_rate_limiter
+    from tests.helpers import (
+        admin_user, make_centre_with_test, make_user, future_iso,
+    )
+
+    admin = admin_user(client)
+    user = make_user(client)
+    data = make_centre_with_test(client, admin.headers)
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMIT_MUTATIONS_PER_MINUTE", 2)
+    reset_rate_limiter()
+    try:
+        bodies = [
+            {"centre_id": data["centre"]["id"], "test_id": data["test"]["id"],
+             "appointment_at": future_iso(days=days)}
+            for days in (2, 3, 4)
+        ]
+        assert client.post("/bookings", headers=user.headers, json=bodies[0]).status_code == 201
+        assert client.post("/bookings", headers=user.headers, json=bodies[1]).status_code == 201
+        resp = client.post("/bookings", headers=user.headers, json=bodies[2])
+        assert resp.status_code == 429
+        assert "Retry-After" in resp.headers
+    finally:
+        reset_rate_limiter()

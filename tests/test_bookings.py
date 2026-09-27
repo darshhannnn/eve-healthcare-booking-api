@@ -1,5 +1,7 @@
 """Booking rules: ownership, validation, slots, cancellation."""
 
+import pytest
+
 
 def test_create_booking_success_snapshots_amount(client):
     from tests.helpers import admin_user, make_centre_with_test, make_user, create_booking
@@ -109,6 +111,82 @@ def test_booking_duplicate_slot_409(client):
               "appointment_at": when},
     )
     assert resp.status_code == 409
+
+
+def test_booking_idempotency_key_replay_returns_same_booking(client):
+    """A retried POST /bookings with the same Idempotency-Key returns the
+    original booking (200) instead of a 409 — mirroring POST /payments."""
+    from tests.helpers import admin_user, make_centre_with_test, make_user, future_iso
+
+    admin = admin_user(client)
+    user = make_user(client)
+    data = make_centre_with_test(client, admin.headers)
+    body = {"centre_id": data["centre"]["id"], "test_id": data["test"]["id"],
+            "appointment_at": future_iso()}
+
+    first = client.post(
+        "/bookings", headers={**user.headers, "Idempotency-Key": "booking-retry-1"}, json=body
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/bookings", headers={**user.headers, "Idempotency-Key": "booking-retry-1"}, json=body
+    )
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+
+
+def test_booking_idempotency_key_scoped_per_user(client):
+    """The same key used by a different account must not replay someone
+    else's booking."""
+    from tests.helpers import admin_user, make_centre_with_test, make_user, future_iso
+
+    admin = admin_user(client)
+    data = make_centre_with_test(client, admin.headers)
+    user_a = make_user(client)
+    user_b = make_user(client)
+    body = {"centre_id": data["centre"]["id"], "test_id": data["test"]["id"],
+            "appointment_at": future_iso()}
+
+    first = client.post(
+        "/bookings", headers={**user_a.headers, "Idempotency-Key": "shared-key"}, json=body
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/bookings", headers={**user_b.headers, "Idempotency-Key": "shared-key"}, json=body
+    )
+    # user_b's replay must not return user_a's booking: either a fresh booking
+    # (201, key collides at commit -> conflict) or an explicit 409 — never user_a's booking.
+    assert second.status_code in (201, 409)
+    if second.status_code == 201:
+        assert second.json()["id"] != first.json()["id"]
+
+
+@pytest.mark.skip(
+    reason="FOR UPDATE row locking is a no-op on SQLite (the suite's in-memory DB); "
+    "the duplicate-slot race is closed on PostgreSQL via the user-row lock — run the "
+    "suite against PostgreSQL to exercise this path"
+)
+def test_concurrent_duplicate_slot_creates_single_booking(client):
+    """Documents the concurrency guarantee: N simultaneous bookings for the
+    same user/centre/test/slot must produce exactly one 201."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tests.helpers import admin_user, make_centre_with_test, make_user, future_iso
+
+    admin = admin_user(client)
+    user = make_user(client)
+    data = make_centre_with_test(client, admin.headers)
+    body = {"centre_id": data["centre"]["id"], "test_id": data["test"]["id"],
+            "appointment_at": future_iso()}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(
+            pool.map(lambda _: client.post("/bookings", headers=user.headers, json=body), range(4))
+        )
+    assert sum(r.status_code == 201 for r in responses) == 1
+    assert sum(r.status_code == 409 for r in responses) == 3
 
 
 def test_booking_rebook_after_cancel_allowed(client):

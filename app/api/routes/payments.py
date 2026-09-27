@@ -22,6 +22,7 @@ from app.schemas.payment import (
     WebhookPayload,
 )
 from app.services import payment_service
+from app.utils.rate_limit import rate_limit
 
 router = APIRouter()
 
@@ -31,6 +32,7 @@ router = APIRouter()
     response_model=PaymentResult,
     status_code=status.HTTP_201_CREATED,
     summary="Pay for a PENDING booking through the mock gateway (auth)",
+    dependencies=[Depends(rate_limit("mutations", "RATE_LIMIT_MUTATIONS_PER_MINUTE"))],
 )
 def create_payment(
     payload: PaymentCreate,

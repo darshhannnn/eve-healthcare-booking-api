@@ -1,6 +1,7 @@
 """Booking use-cases: creation, listing/ownership, cancellation."""
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError, UnprocessableError
@@ -13,7 +14,33 @@ from app.schemas.booking import BookingCreate
 _ACTIVE_STATUSES = (BookingStatus.PENDING.value, BookingStatus.CONFIRMED.value)
 
 
-def create_booking(db: Session, user_id: int, payload: BookingCreate) -> Booking:
+def create_booking(
+    db: Session, user_id: int, payload: BookingCreate, idempotency_key: str | None = None
+) -> tuple[Booking, bool]:
+    """Create a booking. Returns ``(booking, replayed)`` — ``replayed`` is True
+    when an ``Idempotency-Key`` previously seen by this user is satisfied from
+    the store instead of booking again.
+
+    Concurrency: the duplicate-slot check below is a read-then-insert, which
+    is racy on its own, so the user's row is locked ``FOR UPDATE`` first to
+    serialize the same user's booking creations (PostgreSQL; a no-op on the
+    SQLite used for dev/tests, which is single-threaded). The
+    ``IntegrityError`` fallback is the last line of defence.
+    """
+    user = db.get(User, user_id, with_for_update=True)
+    if user is None:
+        raise NotFoundError("User not found")
+
+    if idempotency_key:
+        existing = db.scalar(
+            select(Booking).where(
+                Booking.user_id == user_id,
+                Booking.idempotency_key == idempotency_key,
+            )
+        )
+        if existing is not None:
+            return existing, True
+
     centre = db.get(DiagnosticCentre, payload.centre_id)
     if centre is None or not centre.is_active:
         raise NotFoundError("Diagnostic centre not found")
@@ -56,11 +83,27 @@ def create_booking(db: Session, user_id: int, payload: BookingCreate) -> Booking
         appointment_at=appointment_at,
         amount=offering.price,  # snapshot — later price changes don't touch existing bookings
         status=BookingStatus.PENDING.value,
+        idempotency_key=idempotency_key,
     )
     db.add(booking)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost a race: the same slot (or the same idempotency key) was
+        # created concurrently — the winner is already committed.
+        db.rollback()
+        if idempotency_key:
+            replay = db.scalar(
+                select(Booking).where(Booking.idempotency_key == idempotency_key)
+            )
+            if replay is not None and replay.user_id == user_id:
+                return replay, True
+            raise ConflictError("This Idempotency-Key was already used with another account")
+        raise ConflictError(
+            "You already have an active booking for this test at the selected time"
+        )
     db.refresh(booking)
-    return booking
+    return booking, False
 
 
 def get_booking_for_user(db: Session, booking_id: int, user: User) -> Booking:

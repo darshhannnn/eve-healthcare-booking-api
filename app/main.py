@@ -41,6 +41,13 @@ def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
 
+    # Production deployments can hide interactive docs & the schema entirely.
+    docs_kwargs = (
+        {}
+        if settings.DOCS_ENABLED
+        else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    )
+
     app = FastAPI(
         title=settings.APP_NAME,
         version="1.0.0",
@@ -54,6 +61,7 @@ def create_app() -> FastAPI:
             "which is idempotent."
         ),
         lifespan=lifespan,
+        **docs_kwargs,
     )
 
     app.add_middleware(
