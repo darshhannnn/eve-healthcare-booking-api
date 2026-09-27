@@ -1,10 +1,21 @@
 # EVE Healthcare — Diagnostic Bookings & Simulated Payments API
 
-A small backend service for **diagnostic test bookings** with a **simulated payment gateway** and an **idempotent payment webhook**, built for the EVE Healthcare SDE Intern backend assignment.
+> A production-minded FastAPI backend for **diagnostic test bookings** with a **simulated payment gateway** and an **exactly-once payment webhook** — built for the EVE Healthcare SDE Intern backend assignment.
 
-**Stack:** Python · FastAPI · SQLAlchemy 2 · Pydantic v2 · JWT (PyJWT) · bcrypt · PostgreSQL (docker-compose) / SQLite (zero-setup dev) · pytest
+[![CI](https://github.com/darshhannnn/eve-healthcare-booking-api/actions/workflows/ci.yml/badge.svg)](https://github.com/darshhannnn/eve-healthcare-booking-api/actions/workflows/ci.yml)
+![Tests](https://img.shields.io/badge/tests-68%20passing-brightgreen)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Built with FastAPI](https://img.shields.io/badge/built%20with-FastAPI-009688?logo=fastapi&logoColor=white)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
----
+## Why this repo is worth a read
+
+- **Clean API design** — 22 documented endpoints with a uniform error contract, a shared pagination envelope, and Swagger/OpenAPI at [`/docs`](#quick-start) with one-click auth.
+- **Correct data modelling** — priced centre↔test offerings instead of duplicated rows, amount *snapshotted* at booking time, money as `NUMERIC(10,2)` and JSON strings (never floats), timezone-aware UTC timestamps everywhere.
+- **Idempotency done properly** — every webhook delivery is recorded in an event ledger keyed by the provider's `event_id`; duplicates, conflicting and late events are handled explicitly, with a unique-constraint backstop for concurrent deliveries.
+- **Edge cases first** — 40+ failure paths mapped to specific status codes ([full table](#edge-cases-handled)).
+- **Tested** — 68 tests running in **GitHub Actions CI** on Python 3.11–3.13, with an isolated in-memory database per test.
+- **Ops-ready extras** — Docker & docker-compose with healthchecks, JSON structured logging, rate limiting, a Redis-ready TTL cache, and admin tooling for webhook retries.
 
 ## Contents
 
@@ -22,6 +33,7 @@ A small backend service for **diagnostic test bookings** with a **simulated paym
 - [Assumptions](#assumptions)
 - [What I would improve with more time](#what-i-would-improve-with-more-time)
 - [Project structure](#project-structure)
+- [License](#license)
 
 ---
 
@@ -156,26 +168,33 @@ curl -s -X POST $BASE/bookings/1/cancel -H "Authorization: Bearer $TOKEN"
 
 ## State machines
 
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: POST /bookings (amount snapshotted)
+    PENDING --> CONFIRMED: POST /payments → SUCCESS
+    PENDING --> FAILED: POST /payments → FAILED
+    PENDING --> CANCELLED: cancel (future appointment)
+    CONFIRMED --> CANCELLED: cancel (future appointment)
+    FAILED --> [*]
+    CANCELLED --> [*]
 ```
-Booking                         Payment (mock gateway, synchronous)
-───────                         ───────
-PENDING ── pay SUCCESS ──> CONFIRMED          (created with its final status:
-PENDING ── pay FAILED  ──> FAILED              SUCCESS or FAILED)
-PENDING ── cancel      ──> CANCELLED
-CONFIRMED ── cancel    ──> CANCELLED          (future appointment only)
-FAILED / CANCELLED are terminal
-```
+
+A payment is created with its **final** status (`SUCCESS` or `FAILED`) in the same synchronous call to the mock gateway; webhook events never flip a payment between terminal states.
 
 * The booking's **amount is snapshotted** from the centre's offering price at booking time — later price edits never change existing bookings.
 * Only **PENDING** bookings can be paid; a payment on a cancelled/confirmed/failed booking is a `409`.
 
 ## Database design
 
-```
-users ──< bookings >── diagnostic_centres ──< centre_offerings >── diagnostic_tests
-                          (priced links)              │
-payments >────────────────────────────────────────────┘ (booking_id)
-webhook_events >── payments (nullable)          ── event log for idempotency
+```mermaid
+erDiagram
+    USERS ||--o{ BOOKINGS : places
+    DIAGNOSTIC_CENTRES ||--o{ BOOKINGS : hosts
+    DIAGNOSTIC_TESTS ||--o{ BOOKINGS : "booked as"
+    DIAGNOSTIC_CENTRES ||--o{ CENTRE_OFFERINGS : offers
+    DIAGNOSTIC_TESTS ||--o{ CENTRE_OFFERINGS : "priced at"
+    BOOKINGS ||--o{ PAYMENTS : "charged by"
+    PAYMENTS ||--o{ WEBHOOK_EVENTS : "reported via"
 ```
 
 | Table | Key columns | Notes |
@@ -247,6 +266,7 @@ Design choices worth calling out:
 - **Rate limiting** — fixed-window limiter on auth endpoints (in-memory; swappable for Redis).
 - **Caching** — TTL read cache for centre/test listings with write-through invalidation on admin mutations; **Redis backend supported** via `CACHE_BACKEND=redis` and `REDIS_URL`, with graceful fallback when Redis is down.
 - **Webhook retry handling** — every delivery is persisted with an outcome (`PROCESSED`/`IGNORED`/`UNMATCHED`); unmatched events are retryable from the admin API.
+- **CI** — GitHub Actions runs the full suite with coverage on Python 3.11, 3.12 and 3.13 for every push and pull request.
 
 Celery/background jobs were deliberately left out (no broker dependency in an assignment sandbox) — the natural placement is described in [improvements](#what-i-would-improve-with-more-time).
 
@@ -274,7 +294,7 @@ pytest --cov=app       # with coverage
 pytest tests/test_webhooks.py -v   # just the idempotency suite
 ```
 
-Each test gets a fresh in-memory SQLite database (shared connection pool so the app and assertions see the same data); the suite runs without PostgreSQL or Docker. The same business logic runs against PostgreSQL in docker-compose.
+The same suite runs in **GitHub Actions** (badge at the top) on Python 3.11–3.13 for every push. Each test gets a fresh in-memory SQLite database (shared connection pool so the app and assertions see the same data); the suite runs without PostgreSQL or Docker. The same business logic runs against PostgreSQL in docker-compose.
 
 ## Assumptions
 
@@ -319,6 +339,12 @@ tests/                       # 68 pytest tests, in-memory DB per test
 scripts/smoke.py             # end-to-end happy-path check against a live server
 Dockerfile · docker-compose.yml · requirements.txt · pyproject.toml · .env.example
 ```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ---
 
