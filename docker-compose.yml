@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: eve
+      POSTGRES_PASSWORD: eve
+      POSTGRES_DB: eve
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eve -d eve"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://eve:eve@db:5432/eve
+      ENVIRONMENT: docker
+      # Defaults for local evaluation — override in a real deployment.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-only-change-me}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-whsec_local_dev}
+      SEED_DEMO_DATA: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
