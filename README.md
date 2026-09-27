@@ -188,10 +188,10 @@ A payment is created with its **final** status (`SUCCESS` or `FAILED`) in the sa
 
 ```mermaid
 erDiagram
-    USERS ||--o{ BOOKINGS : places
-    DIAGNOSTIC_CENTRES ||--o{ BOOKINGS : hosts
+    USERS ||--o{ BOOKINGS : "places"
+    DIAGNOSTIC_CENTRES ||--o{ BOOKINGS : "hosts"
     DIAGNOSTIC_TESTS ||--o{ BOOKINGS : "booked as"
-    DIAGNOSTIC_CENTRES ||--o{ CENTRE_OFFERINGS : offers
+    DIAGNOSTIC_CENTRES ||--o{ CENTRE_OFFERINGS : "offers"
     DIAGNOSTIC_TESTS ||--o{ CENTRE_OFFERINGS : "priced at"
     BOOKINGS ||--o{ PAYMENTS : "charged by"
     PAYMENTS ||--o{ WEBHOOK_EVENTS : "reported via"
