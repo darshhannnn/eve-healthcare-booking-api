@@ -1,5 +1,7 @@
 """Password hashing (bcrypt) and JWT issuing/verification (PyJWT)."""
 
+import hashlib
+import hmac
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -47,7 +49,13 @@ def decode_access_token(token: str) -> dict[str, Any]:
 def webhook_signature(raw_body: bytes, secret: str) -> str:
     """HMAC-SHA256 hex digest of the raw request body — the format the
     simulated payment provider uses in its ``X-EVE-Signature`` header."""
-    import hashlib
-    import hmac
-
     return hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+
+
+def verify_webhook_signature(raw_body: bytes, signature: str | None, secret: str) -> bool:
+    """Check a provider signature in constant time (``hmac.compare_digest``)
+    so the request body can't be probed byte-by-byte via timing."""
+    if not signature:
+        return False
+    expected = webhook_signature(raw_body, secret)
+    return hmac.compare_digest(signature.strip().lower(), expected)

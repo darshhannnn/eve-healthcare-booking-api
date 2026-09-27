@@ -28,6 +28,15 @@ def test_webhook_bad_signature_401(client):
     assert resp.status_code == 401
 
 
+def test_webhook_signature_case_insensitive(client):
+    """Signatures are hex-compared in constant time after normalising case."""
+    from tests.helpers import webhook_body
+
+    body = webhook_body("evt_upper_sig", "pay_unknown")
+    resp = post_webhook(client, body, signature=sign_webhook(body).upper())
+    assert resp.status_code == 404  # signature accepted; payment simply unknown
+
+
 def test_webhook_invalid_payload_signed_422(client):
     resp = post_webhook(client, b'{"event_id": "x"}')  # missing fields
     assert resp.status_code == 422

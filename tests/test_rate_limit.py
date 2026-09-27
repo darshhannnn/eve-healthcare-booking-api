@@ -76,3 +76,64 @@ def test_mutating_endpoints_rate_limited(client, monkeypatch):
         assert "Retry-After" in resp.headers
     finally:
         reset_rate_limiter()
+
+
+def test_rate_limiter_ignores_forwarded_for_by_default(client, monkeypatch):
+    """Secure default: a spoofed X-Forwarded-For must not buy a fresh budget."""
+    from app.core.config import get_settings
+    from app.utils.rate_limit import reset_rate_limiter
+    from tests.helpers import signup
+
+    user = signup(client)
+    settings = get_settings()
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMIT_AUTH_PER_MINUTE", 1)
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", False)
+    reset_rate_limiter()
+    try:
+        first = client.post(
+            "/auth/login", json={"email": user.email, "password": user.password},
+            headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+        second = client.post(
+            "/auth/login", json={"email": user.email, "password": user.password},
+            headers={"X-Forwarded-For": "203.0.113.11"},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 429  # same real client -> shared window
+    finally:
+        reset_rate_limiter()
+
+
+def test_rate_limiter_honours_forwarded_for_when_trusted(client, monkeypatch):
+    """Behind a trusted proxy, distinct X-Forwarded-For clients get their own
+    windows instead of sharing the proxy IP's budget."""
+    from app.core.config import get_settings
+    from app.utils.rate_limit import reset_rate_limiter
+    from tests.helpers import signup
+
+    user = signup(client)
+    settings = get_settings()
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMIT_AUTH_PER_MINUTE", 1)
+    monkeypatch.setattr(settings, "TRUST_PROXY_HEADERS", True)
+    reset_rate_limiter()
+    try:
+        first = client.post(
+            "/auth/login", json={"email": user.email, "password": user.password},
+            headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+        assert first.status_code == 200
+        second = client.post(
+            "/auth/login", json={"email": user.email, "password": user.password},
+            headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+        assert second.status_code == 429  # same forwarded IP -> throttled
+
+        other = client.post(
+            "/auth/login", json={"email": user.email, "password": user.password},
+            headers={"X-Forwarded-For": "203.0.113.11"},
+        )
+        assert other.status_code == 200  # different forwarded IP -> own window
+    finally:
+        reset_rate_limiter()

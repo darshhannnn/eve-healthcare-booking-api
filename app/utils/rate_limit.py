@@ -19,6 +19,23 @@ _counters: dict[str, tuple[float, int]] = {}
 _lock = threading.Lock()
 
 
+def _client_key(request: Request) -> str:
+    """Identity used for rate-limit windows.
+
+    Defaults to the socket peer address. Behind a reverse proxy every request
+    shares the proxy's IP, so set ``TRUST_PROXY_HEADERS=true`` to key on the
+    leftmost ``X-Forwarded-For`` entry instead — only do that when the proxy
+    actually overwrites that header, otherwise clients can spoof fresh
+    budgets at will.
+    """
+    settings = get_settings()
+    if settings.TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def rate_limit(scope: str, settings_attr: str = "RATE_LIMIT_AUTH_PER_MINUTE"):
     """Dependency factory enforcing a fixed-window limit per IP.
 
@@ -33,8 +50,7 @@ def rate_limit(scope: str, settings_attr: str = "RATE_LIMIT_AUTH_PER_MINUTE"):
         limit = getattr(settings, settings_attr)
         if limit <= 0:
             return
-        client_ip = request.client.host if request.client else "unknown"
-        key = f"{scope}:{client_ip}"
+        key = f"{scope}:{_client_key(request)}"
         now = time.monotonic()
 
         with _lock:

@@ -56,7 +56,12 @@ class WebhookEvent(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     event_id: Mapped[str] = mapped_column(String(120), unique=True, index=True, nullable=False)
-    payment_id: Mapped[int | None] = mapped_column(ForeignKey("payments.id"), nullable=True)
+    # SET NULL is explicit: an event survives a hard-deleted payment (the
+    # payload still documents what was delivered), and UNMATCHED events are
+    # null by design.
+    payment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("payments.id", ondelete="SET NULL"), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(20), index=True, nullable=False)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     detail: Mapped[str | None] = mapped_column(String(255), nullable=True)

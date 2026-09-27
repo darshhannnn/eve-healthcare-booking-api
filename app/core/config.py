@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     RATE_LIMIT_AUTH_PER_MINUTE: int = 30
     # Applied to mutating endpoints (create/cancel booking, create payment).
     RATE_LIMIT_MUTATIONS_PER_MINUTE: int = 60
+    # Key rate limits on X-Forwarded-For (leftmost entry) instead of the socket
+    # peer — enable ONLY behind a proxy that overwrites that header.
+    TRUST_PROXY_HEADERS: bool = False
 
     # Gate /docs, /redoc and /openapi.json — set false in production.
     DOCS_ENABLED: bool = True

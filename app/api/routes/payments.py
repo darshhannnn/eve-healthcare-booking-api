@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_pagination
 from app.core.config import get_settings
 from app.core.exceptions import UnauthenticatedError, UnprocessableError
-from app.core.security import webhook_signature
+from app.core.security import verify_webhook_signature
 from app.db.session import get_db
 from app.models.booking import BookingStatus
 from app.models.user import User
@@ -112,11 +112,10 @@ async def payment_webhook(request: Request, db: Session = Depends(get_db)) -> We
     raw_body = await request.body()
 
     settings = get_settings()
-    if settings.WEBHOOK_SECRET:
-        signature = request.headers.get("X-EVE-Signature")
-        expected = webhook_signature(raw_body, settings.WEBHOOK_SECRET)
-        if not signature or signature.lower() != expected:
-            raise UnauthenticatedError("Missing or invalid webhook signature")
+    if settings.WEBHOOK_SECRET and not verify_webhook_signature(
+        raw_body, request.headers.get("X-EVE-Signature"), settings.WEBHOOK_SECRET
+    ):
+        raise UnauthenticatedError("Missing or invalid webhook signature")
 
     try:
         payload = WebhookPayload.model_validate_json(raw_body)

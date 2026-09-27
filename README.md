@@ -205,7 +205,7 @@ erDiagram
 | `centre_offerings` | (`centre_id`,`test_id`) **unique**, `price NUMERIC(10,2)` | The same test can be priced differently per centre |
 | `bookings` | `user_id`, `centre_id`, `test_id`, `appointment_at` (tz-aware), `amount NUMERIC(10,2)`, `status` | Indexed on `(user_id, status)`; amount snapshotted |
 | `payments` | `booking_id`, `amount`, `status`, `provider_reference` **unique**, `idempotency_key` **unique** | One charge = one row; retries reuse the row |
-| `webhook_events` | `event_id` **unique**, `payment_id`, `status`, `payload JSON`, `detail` | The idempotency ledger for deliveries |
+| `webhook_events` | `event_id` **unique**, `payment_id` (FK `ON DELETE SET NULL`), `status`, `payload JSON`, `detail` | The idempotency ledger for deliveries |
 
 Design choices worth calling out:
 
@@ -228,7 +228,7 @@ Design choices worth calling out:
 | Unknown `payment_reference` | `404` | Event stored as `UNMATCHED`, retryable via `POST /admin/webhook-events/{id}/retry` |
 | Concurrent duplicate deliveries | one wins, loser hits the `event_id` **unique constraint** → treated as duplicate | No corruption |
 
-**Authenticity:** when `WEBHOOK_SECRET` is set, the raw body must be HMAC-SHA256-signed in the `X-EVE-Signature` header (verified in constant time); mismatch → `401`. Production must set this secret.
+**Authenticity:** when `WEBHOOK_SECRET` is set, the raw body must be HMAC-SHA256-signed in the `X-EVE-Signature` header, verified in constant time via `hmac.compare_digest` (case-insensitive hex); mismatch → `401`. Production must set this secret.
 
 **Why "processed/ignored" rather than state changes?** Documented assumption: the mock gateway resolves **synchronously** — `POST /payments` already settles the booking (as the assignment's flow implies). Webhook deliveries therefore model what real providers send after a charge: confirmations, retries and late events. The endpoint's job — and the hard part — is applying them **exactly once** without corrupting booking state, which is what the rules above guarantee. `POST /payments` additionally supports an `Idempotency-Key` header so clients can retry the charge call itself safely.
 
@@ -286,6 +286,7 @@ All settings come from environment variables (or `.env`, see [.env.example](.env
 | `SEED_DEMO_DATA` | `false` | Seed centres/tests/demo patient |
 | `RATE_LIMIT_AUTH_PER_MINUTE` | `30` (`0` disables) | Auth endpoints, per IP |
 | `RATE_LIMIT_MUTATIONS_PER_MINUTE` | `60` (`0` disables) | Create/cancel booking, create payment, per IP |
+| `TRUST_PROXY_HEADERS` | `false` | Key rate limits on the leftmost `X-Forwarded-For` entry instead of the socket peer — enable **only** behind a proxy that overwrites that header |
 | `DOCS_ENABLED` | `true` | Set `false` in production to disable `/docs`, `/redoc` and `/openapi.json` |
 | `CACHE_BACKEND` / `REDIS_URL` | `memory` / — | `redis` enables the Redis cache backend |
 | `DEFAULT_PAGE_SIZE` / `MAX_PAGE_SIZE` | `20` / `100` | Pagination bounds |
@@ -314,6 +315,8 @@ The same suite runs in **GitHub Actions** (badge at the top) on Python 3.11–3.
 8. **Naive timestamps are UTC.** Clients are encouraged to send explicit offsets.
 9. **Amounts are snapshot-priced** at booking time; later price changes don't affect existing bookings.
 10. **SQLite is a dev/test convenience**; PostgreSQL is the intended production database (psycopg 3 driver).
+11. **Rate limiting keys on the socket peer address.** Behind nginx/a cloud LB every request shares the proxy IP, so `TRUST_PROXY_HEADERS=true` switches to the leftmost `X-Forwarded-For` entry — off by default because a spoofable header would let clients mint fresh budgets.
+12. **Password policy is length-only** (8–72 chars — 72 being bcrypt's input limit). Complexity rules are a product decision better served by breach-corpus checking than regexes.
 
 ## What I would improve with more time
 
