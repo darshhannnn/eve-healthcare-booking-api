@@ -12,7 +12,7 @@
 
 - **Clean API design** — 22 documented endpoints with a uniform error contract, a shared pagination envelope, and Swagger/OpenAPI at [`/docs`](#quick-start) with one-click auth.
 - **Correct data modelling** — priced centre↔test offerings instead of duplicated rows, amount *snapshotted* at booking time, money as `NUMERIC(10,2)` and JSON strings (never floats), timezone-aware UTC timestamps everywhere.
-- **Idempotency done properly** — every webhook delivery is recorded in an event ledger keyed by the provider's `event_id`; duplicates, conflicting and late events are handled explicitly, with a unique-constraint backstop for concurrent deliveries. The same `Idempotency-Key` replay protection covers `POST /bookings` and `POST /payments`, and booking creation serializes per user with a row lock (see [assumptions](#assumptions) for the honest caveats).
+- **Idempotency done properly** — every webhook delivery is recorded in an event ledger keyed by the provider's `event_id`; duplicates, conflicting and late events are handled explicitly, with a unique-constraint backstop for concurrent deliveries. The same `Idempotency-Key` replay protection covers `POST /bookings` and `POST /payments`: keys are scoped **per user** (composite unique, so one user's key can't probe another's), and replaying a key with a *different* payload is rejected Stripe-style instead of silently returning the old result. Booking creation serializes per user with a row lock (see [assumptions](#assumptions) for the honest caveats).
 - **Edge cases first** — 40+ failure paths mapped to specific status codes ([full table](#edge-cases-handled)).
 - **Tested** — 68 tests running in **GitHub Actions CI** on Python 3.11–3.13, with an isolated in-memory database per test.
 - **Ops-ready extras** — Docker & docker-compose with healthchecks, JSON structured logging, rate limiting, a Redis-ready TTL cache, and admin tooling for webhook retries.
@@ -203,8 +203,8 @@ erDiagram
 | `diagnostic_centres` | `name`, `location`, `is_active` | |
 | `diagnostic_tests` | `code` **unique** (e.g. `CBC`), `name` | Global catalogue, independent of centres |
 | `centre_offerings` | (`centre_id`,`test_id`) **unique**, `price NUMERIC(10,2)` | The same test can be priced differently per centre |
-| `bookings` | `user_id`, `centre_id`, `test_id`, `appointment_at` (tz-aware), `amount NUMERIC(10,2)`, `status` | Indexed on `(user_id, status)`; amount snapshotted |
-| `payments` | `booking_id`, `amount`, `status`, `provider_reference` **unique**, `idempotency_key` **unique** | One charge = one row; retries reuse the row |
+| `bookings` | `user_id`, `centre_id`, `test_id`, `appointment_at` (tz-aware), `amount NUMERIC(10,2)`, `status`, `idempotency_key` | Indexed on `(user_id, status)`; amount snapshotted; `(user_id, idempotency_key)` **unique** |
+| `payments` | `user_id`, `booking_id`, `amount`, `status`, `provider_reference` **unique**, `idempotency_key` | One charge = one row; retries reuse the row; `(user_id, idempotency_key)` **unique** + request fingerprint |
 | `webhook_events` | `event_id` **unique**, `payment_id` (FK `ON DELETE SET NULL`), `status`, `payload JSON`, `detail` | The idempotency ledger for deliveries |
 
 Design choices worth calling out:
@@ -256,6 +256,8 @@ Design choices worth calling out:
 | Login/signup flooding | `429` with `Retry-After` (fixed-window, per IP) |
 | Hammering `/bookings`, `/payments` or cancel | `429` with `Retry-After` (separate budget from auth) |
 | Client retry of `POST /bookings` after a timeout | Same `Idempotency-Key` → original booking (`200`) instead of `409` |
+| Same `Idempotency-Key` reused with a *different* request body | `409` "different request payload" — Stripe-style fingerprint check (bookings & payments) |
+| Same `Idempotency-Key` used by a different user | Independent request — keys are unique per user, never globally |
 | Naive datetimes in requests | interpreted as UTC (documented) |
 
 ## Bonus engineering included
@@ -299,9 +301,9 @@ pytest --cov=app       # with coverage
 pytest tests/test_webhooks.py -v   # just the idempotency suite
 ```
 
-The same suite runs in **GitHub Actions** (badge at the top) on Python 3.11–3.13 for every push. Each test gets a fresh in-memory SQLite database (shared connection pool so the app and assertions see the same data); the suite runs without PostgreSQL or Docker. The same business logic runs against PostgreSQL in docker-compose.
+The same suite runs in **GitHub Actions** (badge at the top) **twice**: a matrix on Python 3.11–3.13 against SQLite, and a `test-postgres` job against real PostgreSQL 16 — which is what executes the row-locking concurrency test for real (it's skipped on the SQLite legs, where `FOR UPDATE` is a no-op). Each test gets a fresh database (in-memory SQLite, or the schema recreated on PostgreSQL); the suite needs no Docker locally. The same business logic runs against PostgreSQL in docker-compose.
 
-**Honest caveat:** the row-locking that protects concurrent payment and booking creation is a no-op on SQLite, so this suite structurally cannot exercise it — `test_concurrent_duplicate_slot_creates_single_booking` is permanently skipped with that exact reason, and the guarantee holds on the PostgreSQL path. Running the suite against a PostgreSQL database executes it.
+**Honest caveat:** the row-locking that protects concurrent payment and booking creation is a no-op on SQLite, so the default test legs structurally cannot exercise it — `test_concurrent_duplicate_slot_creates_single_booking` is skipped there with that exact reason. The `test-postgres` CI job closes that gap by running the whole suite against PostgreSQL on every push.
 
 ## Assumptions
 
@@ -311,11 +313,11 @@ The same suite runs in **GitHub Actions** (badge at the top) on Python 3.11–3.
 4. **Cancellation** is allowed for PENDING/CONFIRMED bookings with a **future** appointment; refunds are out of scope (noted as an improvement).
 5. **Centre/test management is admin-only**; reading the catalogue is public. Admin is bootstrapped from env at startup.
 6. **Booking authorization** returns `403` (not 404) for another user's booking — explicit and testable; listing is always owner-scoped.
-7. **Duplicate slot rule:** same user + centre + test + exact appointment time. A read-then-insert duplicate check is racy on its own, so booking creation first takes a `FOR UPDATE` lock on the *user's* row, serializing each user's booking creations on PostgreSQL — the same class of fix the payment path uses (`FOR UPDATE` on the booking row). On SQLite (dev/tests, single-threaded) both locks are no-ops, so the concurrency path is structurally untested by the suite — a partial unique index on PostgreSQL would add DB-level defence in depth (see improvements). Re-booking after cancellation is allowed.
+7. **Duplicate slot rule:** same user + centre + test + exact appointment time. A read-then-insert duplicate check is racy on its own, so booking creation first takes a `FOR UPDATE` lock on the *user's* row, serializing each user's booking creations on PostgreSQL — the same class of fix the payment path uses (`FOR UPDATE` on the booking row). On SQLite both locks are no-ops; the CI `test-postgres` job runs that path for real, and a partial unique index would add DB-level defence in depth (see improvements). Re-booking after cancellation is allowed.
 8. **Naive timestamps are UTC.** Clients are encouraged to send explicit offsets.
 9. **Amounts are snapshot-priced** at booking time; later price changes don't affect existing bookings.
 10. **SQLite is a dev/test convenience**; PostgreSQL is the intended production database (psycopg 3 driver).
-11. **Rate limiting keys on the socket peer address.** Behind nginx/a cloud LB every request shares the proxy IP, so `TRUST_PROXY_HEADERS=true` switches to the leftmost `X-Forwarded-For` entry — off by default because a spoofable header would let clients mint fresh budgets.
+11. **Rate limiting keys on the socket peer address.** Behind nginx/a cloud LB every request shares the proxy IP, so `TRUST_PROXY_HEADERS=true` switches to the leftmost `X-Forwarded-For` entry — off by default because a spoofable header would let clients mint fresh budgets. Counters are in-process fixed windows and stale IP entries are not evicted (bounded by distinct client volume); Redis-backed counters would bound memory and share limits across workers.
 12. **Password policy is length-only** (8–72 chars — 72 being bcrypt's input limit). Complexity rules are a product decision better served by breach-corpus checking than regexes.
 
 ## What I would improve with more time

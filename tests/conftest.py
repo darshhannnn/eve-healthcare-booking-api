@@ -15,18 +15,35 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.core.config import get_settings
 from app.db.base import Base
 from app.db.session import get_db, set_engine
 from app.main import app
 
-# Re-use of a single in-memory DB across connections/threads.
-_TEST_DB_URL = "sqlite://"
-
 
 @pytest.fixture()
 def db_engine():
+    """Point the app at an isolated database.
+
+    Default: a fresh in-memory SQLite database (shared connection pool so
+    the app and test assertions see the same data). When DATABASE_URL points
+    at PostgreSQL (CI's postgres job), use it instead — the schema is
+    recreated per test, which is what lets the row-locking concurrency test
+    run for real.
+    """
+    url = get_settings().DATABASE_URL
+    if url.startswith(("postgres", "postgresql")):
+        engine = create_engine(url)
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        set_engine(engine)
+        yield engine
+        set_engine(None)
+        engine.dispose()
+        return
+
     engine = create_engine(
-        _TEST_DB_URL,
+        "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )

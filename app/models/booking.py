@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String
+from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.time import utcnow
@@ -20,6 +20,9 @@ class Booking(Base):
     __tablename__ = "bookings"
     __table_args__ = (
         Index("ix_bookings_user_status", "user_id", "status"),
+        # Per-user idempotency: the same key from different accounts never
+        # collides, so one user's key can't probe another's.
+        UniqueConstraint("user_id", "idempotency_key", name="uq_bookings_user_idempotency"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -37,10 +40,10 @@ class Booking(Base):
         String(20), default=BookingStatus.PENDING.value, index=True, nullable=False
     )
     # Optional client-supplied key so retried POST /bookings calls are safe
-    # (mirrors payments.idempotency_key).
-    idempotency_key: Mapped[str | None] = mapped_column(
-        String(120), unique=True, index=True, nullable=True
-    )
+    # (mirrors payments). Unique per user, and paired with a fingerprint of
+    # the request so a replayed key with a different payload is rejected.
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

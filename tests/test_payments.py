@@ -139,6 +139,60 @@ def test_idempotency_key_scoped_per_payment(client):
     assert resp.status_code == 201
 
 
+def test_payment_idempotency_key_reusable_across_users(client):
+    """Keys are scoped to the booking's owner — different users can reuse the
+    same key without colliding or learning anything about each other."""
+    from tests.helpers import (
+        admin_user, make_centre_with_test, make_user, create_booking,
+    )
+
+    admin = admin_user(client)
+    data = make_centre_with_test(client, admin.headers)
+    owner_a = make_user(client)
+    owner_b = make_user(client)
+    b_a = create_booking(client, owner_a.headers, data["centre"]["id"], data["test"]["id"])
+    b_b = create_booking(client, owner_b.headers, data["centre"]["id"], data["test"]["id"])
+
+    first = client.post(
+        "/payments", headers={**owner_a.headers, "Idempotency-Key": "shared-pay"},
+        json={"booking_id": b_a["id"]},
+    )
+    second = client.post(
+        "/payments", headers={**owner_b.headers, "Idempotency-Key": "shared-pay"},
+        json={"booking_id": b_b["id"]},
+    )
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert second.json()["id"] != first.json()["id"]
+
+
+def test_payment_idempotency_replay_with_different_payload_conflicts(client):
+    """Stripe-style: the same key aimed at a different booking is rejected."""
+    from tests.helpers import (
+        admin_user, make_centre_with_test, make_user, create_booking, future_iso,
+    )
+
+    admin = admin_user(client)
+    user = make_user(client)
+    data = make_centre_with_test(client, admin.headers)
+    b1 = create_booking(client, user.headers, data["centre"]["id"], data["test"]["id"])
+    b2 = create_booking(client, user.headers, data["centre"]["id"], data["test"]["id"],
+                        when=future_iso(days=3))
+
+    first = client.post(
+        "/payments", headers={**user.headers, "Idempotency-Key": "pay-mismatch"},
+        json={"booking_id": b1["id"]},
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/payments", headers={**user.headers, "Idempotency-Key": "pay-mismatch"},
+        json={"booking_id": b2["id"]},
+    )
+    assert second.status_code == 409
+    assert "different request payload" in second.json()["detail"]
+
+
 def test_payment_listing_owner_only(client):
     from tests.helpers import (
         admin_user, make_centre_with_test, make_user, create_booking, pay_for_booking,

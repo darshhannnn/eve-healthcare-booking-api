@@ -10,6 +10,7 @@ from app.models.booking import Booking, BookingStatus
 from app.models.catalog import CentreOffering, DiagnosticCentre, DiagnosticTest
 from app.models.user import User, UserRole
 from app.schemas.booking import BookingCreate
+from app.utils.idempotency import request_fingerprint
 
 _ACTIVE_STATUSES = (BookingStatus.PENDING.value, BookingStatus.CONFIRMED.value)
 
@@ -21,15 +22,23 @@ def create_booking(
     when an ``Idempotency-Key`` previously seen by this user is satisfied from
     the store instead of booking again.
 
+    Idempotency keys are scoped per user (composite unique on
+    ``(user_id, idempotency_key)``), and the request is fingerprinted: a
+    replayed key with a *different* payload is rejected (Stripe-style) rather
+    than silently returning the first result.
+
     Concurrency: the duplicate-slot check below is a read-then-insert, which
     is racy on its own, so the user's row is locked ``FOR UPDATE`` first to
     serialize the same user's booking creations (PostgreSQL; a no-op on the
-    SQLite used for dev/tests, which is single-threaded). The
-    ``IntegrityError`` fallback is the last line of defence.
+    SQLite used for dev/tests, which is single-threaded).
     """
     user = db.get(User, user_id, with_for_update=True)
     if user is None:
         raise NotFoundError("User not found")
+
+    fingerprint = request_fingerprint(
+        payload.centre_id, payload.test_id, ensure_utc(payload.appointment_at).isoformat()
+    )
 
     if idempotency_key:
         existing = db.scalar(
@@ -39,6 +48,10 @@ def create_booking(
             )
         )
         if existing is not None:
+            if existing.request_fingerprint != fingerprint:
+                raise ConflictError(
+                    "This Idempotency-Key was already used with a different request payload"
+                )
             return existing, True
 
     centre = db.get(DiagnosticCentre, payload.centre_id)
@@ -84,21 +97,30 @@ def create_booking(
         amount=offering.price,  # snapshot — later price changes don't touch existing bookings
         status=BookingStatus.PENDING.value,
         idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
     )
     db.add(booking)
     try:
         db.commit()
     except IntegrityError:
-        # Lost a race: the same slot (or the same idempotency key) was
-        # created concurrently — the winner is already committed.
+        # The only unique constraint this INSERT can violate is
+        # (user_id, idempotency_key): a concurrent retry of the same key by
+        # the same user. There is deliberately no slot constraint — the
+        # duplicate-slot race is prevented by the user-row lock above.
         db.rollback()
         if idempotency_key:
             replay = db.scalar(
-                select(Booking).where(Booking.idempotency_key == idempotency_key)
+                select(Booking).where(
+                    Booking.user_id == user_id,
+                    Booking.idempotency_key == idempotency_key,
+                )
             )
-            if replay is not None and replay.user_id == user_id:
+            if replay is not None:
+                if replay.request_fingerprint != fingerprint:
+                    raise ConflictError(
+                        "This Idempotency-Key was already used with a different request payload"
+                    )
                 return replay, True
-            raise ConflictError("This Idempotency-Key was already used with another account")
         raise ConflictError(
             "You already have an active booking for this test at the selected time"
         )

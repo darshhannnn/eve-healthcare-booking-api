@@ -27,6 +27,7 @@ from app.models.booking import Booking, BookingStatus
 from app.models.payment import Payment, PaymentStatus, WebhookEvent, WebhookEventStatus
 from app.models.user import User, UserRole
 from app.schemas.payment import WebhookPayload
+from app.utils.idempotency import request_fingerprint
 
 
 def create_payment(
@@ -39,8 +40,9 @@ def create_payment(
     """Charge a PENDING booking through the mock gateway.
 
     Returns ``(payment, replayed)`` — ``replayed`` is True when an
-    ``Idempotency-Key`` previously seen was satisfied from the store instead
-    of charging again.
+    ``Idempotency-Key`` previously seen (scoped to the booking's owner) is
+    satisfied from the store instead of charging again. A replayed key with a
+    *different* request payload is rejected Stripe-style rather than replayed.
     """
     # Row lock so two concurrent payments cannot both observe PENDING (PG).
     # SQLite (dev/tests) ignores FOR UPDATE and is protected by the checks below.
@@ -50,11 +52,24 @@ def create_payment(
     if booking.user_id != user.id and user.role != UserRole.ADMIN.value:
         raise ForbiddenError("You cannot pay for another user's booking")
 
+    # Canonicalise the outcome so an omitted field and "success" fingerprint
+    # identically; booking_id pins the replay to the same target.
+    fingerprint = request_fingerprint(booking_id, simulate_outcome or "success")
+
     # Satisfy replays before state checks so a retry after a successful
     # payment returns the original payment instead of a conflict.
     if idempotency_key:
-        existing = db.scalar(select(Payment).where(Payment.idempotency_key == idempotency_key))
+        existing = db.scalar(
+            select(Payment).where(
+                Payment.user_id == booking.user_id,
+                Payment.idempotency_key == idempotency_key,
+            )
+        )
         if existing is not None:
+            if existing.request_fingerprint != fingerprint:
+                raise ConflictError(
+                    "This Idempotency-Key was already used with a different request payload"
+                )
             return existing, True
 
     if booking.status != BookingStatus.PENDING.value:
@@ -62,11 +77,13 @@ def create_payment(
 
     outcome = PaymentStatus.FAILED if simulate_outcome == "failure" else PaymentStatus.SUCCESS
     payment = Payment(
+        user_id=booking.user_id,
         booking_id=booking.id,
         amount=booking.amount,
         status=outcome.value,
         provider_reference=f"pay_{uuid.uuid4().hex}",
         idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
     )
     booking.status = (
         BookingStatus.CONFIRMED.value if outcome is PaymentStatus.SUCCESS
@@ -76,14 +93,24 @@ def create_payment(
     try:
         db.commit()
     except IntegrityError:
-        # Lost a race on the same idempotency key — return the winner.
+        # The only unique constraint this INSERT can violate is
+        # (user_id, idempotency_key): a concurrent retry of the same key.
         db.rollback()
         if not idempotency_key:
             raise
-        existing = db.scalar(select(Payment).where(Payment.idempotency_key == idempotency_key))
-        if existing is None:
+        replay = db.scalar(
+            select(Payment).where(
+                Payment.user_id == booking.user_id,
+                Payment.idempotency_key == idempotency_key,
+            )
+        )
+        if replay is None:
             raise
-        return existing, True
+        if replay.request_fingerprint != fingerprint:
+            raise ConflictError(
+                "This Idempotency-Key was already used with a different request payload"
+            )
+        return replay, True
     db.refresh(payment)
     return payment, False
 

@@ -2,6 +2,10 @@
 
 import pytest
 
+from app.core.config import get_settings
+
+_ON_POSTGRES = get_settings().DATABASE_URL.startswith(("postgres", "postgresql"))
+
 
 def test_create_booking_success_snapshots_amount(client):
     from tests.helpers import admin_user, make_centre_with_test, make_user, create_booking
@@ -136,9 +140,9 @@ def test_booking_idempotency_key_replay_returns_same_booking(client):
     assert second.json()["id"] == first.json()["id"]
 
 
-def test_booking_idempotency_key_scoped_per_user(client):
-    """The same key used by a different account must not replay someone
-    else's booking."""
+def test_booking_idempotency_key_reusable_across_users(client):
+    """Keys are scoped per user (composite unique on user_id + key), so one
+    user's key never collides with — or leaks information about — another's."""
     from tests.helpers import admin_user, make_centre_with_test, make_user, future_iso
 
     admin = admin_user(client)
@@ -156,17 +160,40 @@ def test_booking_idempotency_key_scoped_per_user(client):
     second = client.post(
         "/bookings", headers={**user_b.headers, "Idempotency-Key": "shared-key"}, json=body
     )
-    # user_b's replay must not return user_a's booking: either a fresh booking
-    # (201, key collides at commit -> conflict) or an explicit 409 — never user_a's booking.
-    assert second.status_code in (201, 409)
-    if second.status_code == 201:
-        assert second.json()["id"] != first.json()["id"]
+    assert second.status_code == 201  # independent booking, not a replay
+    assert second.json()["id"] != first.json()["id"]
 
 
-@pytest.mark.skip(
-    reason="FOR UPDATE row locking is a no-op on SQLite (the suite's in-memory DB); "
-    "the duplicate-slot race is closed on PostgreSQL via the user-row lock — run the "
-    "suite against PostgreSQL to exercise this path"
+def test_booking_idempotency_replay_with_different_payload_conflicts(client):
+    """Stripe-style: the same key with a different request must be rejected,
+    not silently answered with the original booking."""
+    from tests.helpers import admin_user, make_centre_with_test, make_user, create_booking, future_iso
+
+    admin = admin_user(client)
+    user = make_user(client)
+    data = make_centre_with_test(client, admin.headers)
+
+    first = client.post(
+        "/bookings", headers={**user.headers, "Idempotency-Key": "key-mismatch"},
+        json={"centre_id": data["centre"]["id"], "test_id": data["test"]["id"],
+              "appointment_at": future_iso(days=2)},
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/bookings", headers={**user.headers, "Idempotency-Key": "key-mismatch"},
+        json={"centre_id": data["centre"]["id"], "test_id": data["test"]["id"],
+              "appointment_at": future_iso(days=3)},  # different request, same key
+    )
+    assert second.status_code == 409
+    assert "different request payload" in second.json()["detail"]
+
+
+@pytest.mark.skipif(
+    not _ON_POSTGRES,
+    reason="FOR UPDATE row locking is a no-op on SQLite (the suite's default DB); "
+    "this test runs for real in the CI 'test-postgres' job, where the suite "
+    "executes against PostgreSQL",
 )
 def test_concurrent_duplicate_slot_creates_single_booking(client):
     """Documents the concurrency guarantee: N simultaneous bookings for the
