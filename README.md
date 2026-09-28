@@ -110,7 +110,7 @@ Interactive docs: **`/docs`** (Swagger UI) and **`/redoc`**. All responses are J
 | POST | `/admin/webhook-events/{id}/retry` | Admin | Reprocess a stored event |
 | GET | `/health` | — | Liveness probe |
 
-> Paths are canonical without a trailing slash (`/payments`); a request to `/payments/` is answered with a `307` redirect that preserves the method.
+> Paths are canonical without a trailing slash, and the two paths the assignment writes with one — `POST /payments/` and `POST /payments/webhook/` — answer **directly at both forms** (hidden twins, same status codes, auth and rate limits). Any other trailing-slash request is answered with a `307` redirect that preserves the method.
 
 ### Example payloads
 

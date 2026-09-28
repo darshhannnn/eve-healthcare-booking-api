@@ -65,6 +65,19 @@ def create_payment(
     )
 
 
+# The assignment spec literally writes POST /payments/ — register the same
+# endpoint at the trailing-slash path so the spec's exact URL answers
+# directly instead of via a 307 redirect. Full kwargs (not a stacked bare
+# decorator) so status code, schema and rate limit match the canonical route.
+router.post(
+    "/payments/",
+    response_model=PaymentResult,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit("mutations", "RATE_LIMIT_MUTATIONS_PER_MINUTE"))],
+    include_in_schema=False,
+)(create_payment)
+
+
 @router.get(
     "/payments",
     response_model=Page[PaymentOut],
@@ -129,3 +142,12 @@ async def payment_webhook(request: Request, db: Session = Depends(get_db)) -> We
         result=result["result"],
         detail=result.get("detail"),
     )
+
+
+# Spec-literal twin: POST /payments/webhook/ (trailing slash) as written in
+# the assignment, answering directly without a redirect.
+router.post(
+    "/payments/webhook/",
+    response_model=WebhookAck,
+    include_in_schema=False,
+)(payment_webhook)

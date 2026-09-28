@@ -211,3 +211,38 @@ def test_payment_listing_owner_only(client):
     detail = client.get("/payments", headers=owner.headers).json()["items"][0]
     assert client.get(f"/payments/{detail['id']}", headers=stranger.headers).status_code == 403
     assert client.get(f"/payments/{detail['id']}", headers=admin.headers).status_code == 200
+
+
+def test_spec_trailing_slash_paths_answer_directly(client):
+    """The assignment spec writes POST /payments/ and POST /payments/webhook/
+    with trailing slashes — those exact paths must return real responses, not
+    307 redirects that curl won't follow."""
+    import hmac as hmac_mod
+
+    from tests.helpers import (
+        admin_user, make_centre_with_test, make_user, create_booking,
+        sign_webhook, webhook_body,
+    )
+    from app.core.config import get_settings
+
+    admin = admin_user(client)
+    user = make_user(client)
+    data = make_centre_with_test(client, admin.headers)
+    booking = create_booking(client, user.headers, data["centre"]["id"], data["test"]["id"])
+
+    resp = client.post(
+        "/payments/", headers=user.headers,
+        json={"booking_id": booking["id"]},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 201  # a 307 would mean only the bare path exists
+
+    body = webhook_body("evt_slash_path", resp.json()["provider_reference"], "SUCCESS")
+    sig = sign_webhook(body, get_settings().WEBHOOK_SECRET)
+    resp = client.post(
+        "/payments/webhook/", content=body,
+        headers={"X-EVE-Signature": sig},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["event_id"] == "evt_slash_path"
