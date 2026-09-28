@@ -1,21 +1,11 @@
 # EVE Healthcare — Diagnostic Bookings & Simulated Payments API
 
-> A production-minded FastAPI backend for **diagnostic test bookings** with a **simulated payment gateway** and an **exactly-once payment webhook** — built for the EVE Healthcare SDE Intern backend assignment.
+> FastAPI backend for **diagnostic test bookings** with a **simulated payment gateway** and an **exactly-once payment webhook** — built for the EVE Healthcare SDE Intern backend assignment.
 
 [![CI](https://github.com/darshhannnn/eve-healthcare-booking-api/actions/workflows/ci.yml/badge.svg)](https://github.com/darshhannnn/eve-healthcare-booking-api/actions/workflows/ci.yml)
-![Tests](https://img.shields.io/badge/tests-68%20passing-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Built with FastAPI](https://img.shields.io/badge/built%20with-FastAPI-009688?logo=fastapi&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-
-## Why this repo is worth a read
-
-- **Clean API design** — 22 documented endpoints with a uniform error contract, a shared pagination envelope, and Swagger/OpenAPI at [`/docs`](#quick-start) with one-click auth.
-- **Correct data modelling** — priced centre↔test offerings instead of duplicated rows, amount *snapshotted* at booking time, money as `NUMERIC(10,2)` and JSON strings (never floats), timezone-aware UTC timestamps everywhere.
-- **Idempotency done properly** — every webhook delivery is recorded in an event ledger keyed by the provider's `event_id`; duplicates, conflicting and late events are handled explicitly, with a unique-constraint backstop for concurrent deliveries. The same `Idempotency-Key` replay protection covers `POST /bookings` and `POST /payments`: keys are scoped **per user** (composite unique, so one user's key can't probe another's), and replaying a key with a *different* payload is rejected Stripe-style instead of silently returning the old result. Booking creation serializes per user with a row lock (see [assumptions](#assumptions) for the honest caveats).
-- **Edge cases first** — 40+ failure paths mapped to specific status codes ([full table](#edge-cases-handled)).
-- **Tested** — 68 tests running in **GitHub Actions CI** on Python 3.11–3.13, with an isolated in-memory database per test.
-- **Ops-ready extras** — Docker & docker-compose with healthchecks, JSON structured logging, rate limiting, a Redis-ready TTL cache, and admin tooling for webhook retries.
 
 ## Contents
 
@@ -270,7 +260,7 @@ Design choices worth calling out:
 - **Rate limiting** — fixed-window limiter on auth endpoints *and* on mutating endpoints (create/cancel booking, create payment), in-memory; swappable for Redis.
 - **Caching** — TTL read cache for centre/test listings with write-through invalidation on admin mutations; **Redis backend supported** via `CACHE_BACKEND=redis` and `REDIS_URL`, with graceful fallback when Redis is down.
 - **Webhook retry handling** — every delivery is persisted with an outcome (`PROCESSED`/`IGNORED`/`UNMATCHED`); unmatched events are retryable from the admin API.
-- **CI** — GitHub Actions runs the full suite with coverage on Python 3.11, 3.12 and 3.13 for every push and pull request.
+- **CI** — GitHub Actions: a `lint` job (ruff) runs first, then a matrix on Python 3.11–3.13 against SQLite, and a `test-postgres` job against real PostgreSQL 16 — the two jobs that exercise the row-locking and concurrent-delivery concurrency guarantees for real.
 
 Celery/background jobs were deliberately left out (no broker dependency in an assignment sandbox) — the natural placement is described in [improvements](#what-i-would-improve-with-more-time).
 
@@ -301,9 +291,9 @@ pytest --cov=app       # with coverage
 pytest tests/test_webhooks.py -v   # just the idempotency suite
 ```
 
-The same suite runs in **GitHub Actions** (badge at the top) **twice**: a matrix on Python 3.11–3.13 against SQLite, and a `test-postgres` job against real PostgreSQL 16 — which is what executes the row-locking concurrency test for real (it's skipped on the SQLite legs, where `FOR UPDATE` is a no-op). Each test gets a fresh database (in-memory SQLite, or the schema recreated on PostgreSQL); the suite needs no Docker locally. The same business logic runs against PostgreSQL in docker-compose.
+The same suite runs in **GitHub Actions** (badge at the top) **three times**: a `lint` job (ruff) gates the rest, then a matrix on Python 3.11–3.13 against SQLite, and a `test-postgres` job against real PostgreSQL 16 — which is what executes the row-locking and concurrent webhook delivery concurrency tests for real (both are skipped on the SQLite legs, where `FOR UPDATE` and the unique-constraint race are no-ops). Each test gets a fresh database (in-memory SQLite, or the schema recreated on PostgreSQL); the suite needs no Docker locally. The same business logic runs against PostgreSQL in docker-compose.
 
-**Honest caveat:** the row-locking that protects concurrent payment and booking creation is a no-op on SQLite, so the default test legs structurally cannot exercise it — `test_concurrent_duplicate_slot_creates_single_booking` is skipped there with that exact reason. The `test-postgres` CI job closes that gap by running the whole suite against PostgreSQL on every push.
+**Honest caveat:** the row-locking that protects concurrent payment and booking creation is a no-op on SQLite, so the default test legs structurally cannot exercise it — `test_concurrent_duplicate_slot_creates_single_booking` and `test_concurrent_duplicate_webhook_delivery_is_idempotent` are both skipped there with that exact reason. The `test-postgres` CI job closes that gap by running the whole suite against PostgreSQL on every push.
 
 ## Assumptions
 
@@ -313,7 +303,7 @@ The same suite runs in **GitHub Actions** (badge at the top) **twice**: a matrix
 4. **Cancellation** is allowed for PENDING/CONFIRMED bookings with a **future** appointment; refunds are out of scope (noted as an improvement).
 5. **Centre/test management is admin-only**; reading the catalogue is public. Admin is bootstrapped from env at startup.
 6. **Booking authorization** returns `403` (not 404) for another user's booking — explicit and testable; listing is always owner-scoped.
-7. **Duplicate slot rule:** same user + centre + test + exact appointment time. A read-then-insert duplicate check is racy on its own, so booking creation first takes a `FOR UPDATE` lock on the *user's* row, serializing each user's booking creations on PostgreSQL — the same class of fix the payment path uses (`FOR UPDATE` on the booking row). On SQLite both locks are no-ops; the CI `test-postgres` job runs that path for real, and a partial unique index would add DB-level defence in depth (see improvements). Re-booking after cancellation is allowed.
+7. **Duplicate slot rule:** same user + centre + test + exact appointment time. A read-then-insert duplicate check is racy on its own, so booking creation first takes a `FOR UPDATE` lock on the *user's* row, serializing each user's booking creations on PostgreSQL — the same class of fix the payment path uses (`FOR UPDATE` on the booking row). On SQLite both locks are no-ops; the CI `test-postgres` job runs that path for real. The `uq_bookings_active_slot` partial unique index (`WHERE status != 'CANCELLED'`) adds DB-level defence in depth on PostgreSQL (ignored on SQLite, where the app-level check runs first). Re-booking after cancellation is allowed.
 8. **Naive timestamps are UTC.** Clients are encouraged to send explicit offsets.
 9. **Amounts are snapshot-priced** at booking time; later price changes don't affect existing bookings.
 10. **SQLite is a dev/test convenience**; PostgreSQL is the intended production database (psycopg 3 driver).
@@ -326,11 +316,10 @@ The same suite runs in **GitHub Actions** (badge at the top) **twice**: a matrix
 2. **Async payment flow with Celery + Redis:** `POST /payments` would enqueue a `process_payment` task (broker = Redis), return `PENDING`, and the worker would settle the booking and emit the webhook — making the webhook the primary settlement path, with exponential-backoff retries for transient failures.
 3. **Provider abstraction:** an interface the mock implements, so a real gateway (Stripe/Razorpay) can be added without touching booking logic; signatures verified via the same webhook path.
 4. **Refresh tokens & revocation** (jti denylist), email verification, password reset.
-5. **PostgreSQL partial unique index** (`WHERE status <> 'CANCELLED'`) on the booking slot as DB-level defence in depth on top of the user-row lock.
-6. **Redis-backed rate limiting and distributed locks** (`SELECT … FOR UPDATE` is already used for payment transitions) for multi-worker deployments.
-7. **Observability:** Prometheus metrics, trace ids propagated to logs, Sentry.
-8. **Tooling & hardening:** ruff/mypy in CI, pre-commit, gunicorn+uvicorn workers, per-endpoint OpenAPI examples, a Postman collection.
-9. **API versioning** (`/v1/...`) before the contract has real external clients; the routers are already grouped to make that a one-line prefix change.
+5. **Redis-backed rate limiting and distributed locks** (`SELECT … FOR UPDATE` is already used for payment transitions) for multi-worker deployments.
+6. **Observability:** Prometheus metrics, trace ids propagated to logs, Sentry.
+7. **Tooling & hardening:** mypy in CI, pre-commit, gunicorn+uvicorn workers, per-endpoint OpenAPI examples, a Postman collection.
+8. **API versioning** (`/v1/...`) before the contract has real external clients; the routers are already grouped to make that a one-line prefix change.
 
 ## Project structure
 
@@ -347,7 +336,7 @@ app/
     ├── deps.py              # get_current_user, require_admin, pagination
     ├── router.py            # router aggregation
     └── routes/              # auth, catalog, bookings, payments, admin
-tests/                       # 68 pytest tests, in-memory DB per test
+tests/                       # 70 pytest tests, in-memory DB per test
 scripts/smoke.py             # end-to-end happy-path check against a live server
 Dockerfile · docker-compose.yml · requirements.txt · pyproject.toml · .env.example
 ```
@@ -357,7 +346,3 @@ Dockerfile · docker-compose.yml · requirements.txt · pyproject.toml · .env.e
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
----
-
-Good luck reviewing — happy to walk through any design decision!

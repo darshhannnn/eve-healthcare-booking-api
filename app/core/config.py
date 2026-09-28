@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,7 +27,7 @@ class Settings(BaseSettings):
 
     # Bootstrap admin account, created at startup when missing.
     ADMIN_EMAIL: str = "admin@example.com"
-    ADMIN_PASSWORD: str = "Admin@12345"
+    ADMIN_PASSWORD: str = "Admin@12345"  # MUST be overridden outside development
     ADMIN_FULL_NAME: str = "EVE Admin"
 
     SEED_DEMO_DATA: bool = False
@@ -52,6 +53,31 @@ class Settings(BaseSettings):
 
     DEFAULT_PAGE_SIZE: int = 20
     MAX_PAGE_SIZE: int = 100
+
+    @model_validator(mode="after")
+    def _fail_closed_on_insecure_defaults(self) -> "Settings":
+        """Prevent accidental production deployments with weak defaults.
+
+        * An empty WEBHOOK_SECRET disables signature verification — never
+          acceptable outside the development sandbox.
+        * Leaving ADMIN_PASSWORD at the shipped default means every attacker
+          with the source already knows it.
+        """
+        if self.ENVIRONMENT != "development":
+            _DEFAULT_ADMIN_PASSWORD = "Admin@12345"
+            if self.ADMIN_PASSWORD == _DEFAULT_ADMIN_PASSWORD:
+                raise ValueError(
+                    "ADMIN_PASSWORD must be changed from the default value "
+                    f"when ENVIRONMENT is '{self.ENVIRONMENT}'. "
+                    "Set a strong password via the ADMIN_PASSWORD env variable."
+                )
+            if not self.WEBHOOK_SECRET:
+                raise ValueError(
+                    "WEBHOOK_SECRET must be set (non-empty) when ENVIRONMENT is "
+                    f"'{self.ENVIRONMENT}'. An empty secret disables webhook "
+                    "signature verification, which is only safe in local development."
+                )
+        return self
 
 
 @lru_cache

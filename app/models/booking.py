@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.time import utcnow
@@ -53,3 +53,19 @@ class Booking(Base):
 
     centre = relationship("DiagnosticCentre")
     test = relationship("DiagnosticTest")
+
+
+# DB-level defence in depth for the duplicate-slot rule: a user cannot have two
+# non-cancelled bookings for the same centre+test+slot. The .ddl_if() guard
+# means create_all (and Alembic) only emits this index on PostgreSQL; on SQLite
+# (dev/tests) it is silently skipped, leaving re-booking after cancellation
+# unblocked (the app-level check runs first and is the primary guard there).
+_active_slot_index = Index(
+    "uq_bookings_active_slot",
+    Booking.user_id,
+    Booking.centre_id,
+    Booking.test_id,
+    Booking.appointment_at,
+    unique=True,
+    postgresql_where=text("status != 'CANCELLED'"),
+).ddl_if(dialect="postgresql")

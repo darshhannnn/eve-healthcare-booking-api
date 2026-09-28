@@ -1,6 +1,11 @@
 """Webhook contract: signatures, idempotency, conflicting/unmatched events."""
 
+import pytest
+
+from app.core.config import get_settings
 from tests.helpers import sign_webhook, webhook_body
+
+_ON_POSTGRES = get_settings().DATABASE_URL.startswith(("postgres", "postgresql"))
 
 
 def post_webhook(client, body: bytes, sign: bool = True, secret: str = "test-webhook-secret",
@@ -175,3 +180,47 @@ def test_admin_lists_webhook_events_and_retries(client):
 
     unknown = client.post("/admin/webhook-events/99999/retry", headers=admin.headers)
     assert unknown.status_code == 404
+
+
+@pytest.mark.skipif(
+    not _ON_POSTGRES,
+    reason=(
+        "SQLite serialises all writes so the unique-constraint race path is never "
+        "reached there. This test runs for real in the CI 'test-postgres' job, "
+        "where concurrent deliveries actually contend on the event_id unique index."
+    ),
+)
+def test_concurrent_duplicate_webhook_delivery_is_idempotent(client):
+    """Documents the concurrency guarantee: N threads delivering the same
+    webhook event simultaneously must result in exactly one 'processed' and
+    the rest must be 'duplicate' — no double-processing and no 5xx errors."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tests.helpers import (
+        admin_user, make_centre_with_test, make_user, create_booking, pay_for_booking,
+    )
+
+    admin = admin_user(client)
+    user = make_user(client)
+    data = make_centre_with_test(client, admin.headers)
+    booking = create_booking(client, user.headers, data["centre"]["id"], data["test"]["id"])
+    payment = pay_for_booking(client, user.headers, booking["id"])
+
+    body = webhook_body("evt_concurrent_001", payment["provider_reference"], "SUCCESS")
+    sig = sign_webhook(body)
+
+    def deliver(_):
+        return post_webhook(client, body, signature=sig)
+
+    n_threads = 6
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        responses = list(pool.map(deliver, range(n_threads)))
+
+    status_codes = [r.status_code for r in responses]
+    results = [r.json()["result"] for r in responses]
+
+    # All must return 200 — no 5xx from a lost race.
+    assert all(s == 200 for s in status_codes), status_codes
+    # Exactly one thread processed the event; the rest saw it as a duplicate.
+    assert results.count("processed") == 1, results
+    assert results.count("duplicate") == n_threads - 1, results

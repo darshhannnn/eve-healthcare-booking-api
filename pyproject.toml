@@ -8,3 +8,14 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ["app"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# E/W = pycodestyle, F = pyflakes — a fast baseline that catches real bugs.
+select = ["E", "W", "F"]
+ignore = [
+    "E501",  # line too long — handled by formatter; long strings in docstrings are intentional
+    "E402",  # module-level import not at top — conftest.py sets env vars before importing app
+]
