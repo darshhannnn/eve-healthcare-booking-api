@@ -202,7 +202,7 @@ Design choices worth calling out:
 * **Money is `NUMERIC(10,2)`** in the DB and a **string** in JSON — never floats.
 * **Many-to-many with price** (`centre_offerings`) instead of duplicating tests per centre, so a test's identity lives in one place while centres own their pricing.
 * **All timestamps are timezone-aware UTC**; SQLite (dev) round-trips naive values, so the schema layer normalises every datetime to UTC on the way out.
-* Schema is created via `Base.metadata.create_all` at startup — fine for this scope; Alembic migrations are the first thing I'd add (see [improvements](#what-i-would-improve-with-more-time)).
+* **Database migrations** are managed via Alembic; the initial migration (`001_initial_schema`) defines the complete schema. Use `alembic upgrade head` to apply migrations; the app still falls back to `create_all` at startup for backwards compatibility.
 
 ## Webhook design & idempotency
 
@@ -264,6 +264,29 @@ Design choices worth calling out:
 
 Celery/background jobs were deliberately left out (no broker dependency in an assignment sandbox) — the natural placement is described in [improvements](#what-i-would-improve-with-more-time).
 
+## Database migrations
+
+The project uses **Alembic** for database schema migrations. The initial migration (`001_initial_schema`) defines the complete database schema.
+
+```bash
+# Apply all migrations
+alembic upgrade head
+
+# Create a new migration (after model changes)
+alembic revision --autogenerate -m "Description of changes"
+
+# Rollback to previous version
+alembic downgrade -1
+
+# View migration history
+alembic history
+
+# View current revision
+alembic current
+```
+
+The app still falls back to `Base.metadata.create_all` at startup for backwards compatibility with existing deployments, but production should use Alembic migrations for schema changes.
+
 ## Configuration
 
 All settings come from environment variables (or `.env`, see [.env.example](.env.example)):
@@ -312,7 +335,7 @@ The same suite runs in **GitHub Actions** (badge at the top) **three times**: a 
 
 ## What I would improve with more time
 
-1. **Alembic migrations** instead of `create_all`, plus CI running the suite against a real PostgreSQL service container.
+1. **CI running the suite against a real PostgreSQL service container** — currently the `test-postgres` job runs against PostgreSQL, but adding a service container to the matrix would close the loop completely.
 2. **Async payment flow with Celery + Redis:** `POST /payments` would enqueue a `process_payment` task (broker = Redis), return `PENDING`, and the worker would settle the booking and emit the webhook — making the webhook the primary settlement path, with exponential-backoff retries for transient failures.
 3. **Provider abstraction:** an interface the mock implements, so a real gateway (Stripe/Razorpay) can be added without touching booking logic; signatures verified via the same webhook path.
 4. **Refresh tokens & revocation** (jti denylist), email verification, password reset.
